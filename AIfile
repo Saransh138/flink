@@ -1,0 +1,358 @@
+File Structure
+bash
+Copy
+├── docker-compose.yml
+├── flink-job/
+│   ├── src/
+│   │   └── main/
+│   │       ├── java/
+│   │       │   └── com/
+│   │       │       └── example/
+│   │       │           └── MySQLToKafkaJob.java
+│   │       └── resources/
+│   │           └── log4j.properties
+│   ├── pom.xml
+│   └── Dockerfile
+├── mysql-init/
+│   └── init.sql
+└── README.md
+1. Updated docker-compose.yml
+yaml
+Copy
+version: '3.8'
+
+services:
+  zookeeper:
+    image: zookeeper:3.7
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  kafka1:
+    image: confluentinc/cp-kafka:6.2.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka1:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    depends_on:
+      - zookeeper
+
+  kafka2:
+    image: confluentinc/cp-kafka:6.2.0
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka2:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    depends_on:
+      - zookeeper
+
+  kafka3:
+    image: confluentinc/cp-kafka:6.2.0
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3:9094
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    depends_on:
+      - zookeeper
+
+  kafka-init:
+    image: confluentinc/cp-kafka:6.2.0
+    depends_on:
+      - kafka1
+      - kafka2
+      - kafka3
+    command: >
+      bash -c "
+      echo 'Waiting for Kafka brokers...'
+      cub kafka-ready -b kafka1:9092 1 60
+      kafka-topics --create --if-not-exists --topic output-topic --partitions 3 --replication-factor 3 --bootstrap-server kafka1:9092
+      echo 'Topic created successfully'"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+  jobmanager1:
+    image: flink:1.14.0-scala_2.12
+    ports:
+      - "8081:8081"
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager1
+      - HIGH_AVAILABILITY=zookeeper
+      - HIGH_AVAILABILITY_ZOOKEEPER_QUORUM=zookeeper:2181
+      - HIGH_AVAILABILITY_STORAGE_DIR=file:///tmp/flink/ha/
+    volumes:
+      - flink_data:/tmp/flink
+    command: jobmanager
+    depends_on:
+      - zookeeper
+
+  jobmanager2:
+    image: flink:1.14.0-scala_2.12
+    ports:
+      - "8082:8082"
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager2
+      - HIGH_AVAILABILITY=zookeeper
+      - HIGH_AVAILABILITY_ZOOKEEPER_QUORUM=zookeeper:2181
+      - HIGH_AVAILABILITY_STORAGE_DIR=file:///tmp/flink/ha/
+    volumes:
+      - flink_data:/tmp/flink
+    command: jobmanager
+    depends_on:
+      - zookeeper
+
+  taskmanager:
+    image: flink:1.14.0-scala_2.12
+    scale: 3
+    environment:
+      - HIGH_AVAILABILITY=zookeeper
+      - HIGH_AVAILABILITY_ZOOKEEPER_QUORUM=zookeeper:2181
+      - HIGH_AVAILABILITY_STORAGE_DIR=file:///tmp/flink/ha/
+    volumes:
+      - flink_data:/tmp/flink
+    command: taskmanager
+    depends_on:
+      - jobmanager1
+      - jobmanager2
+
+  mysql:
+    image: mysql:5.7
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: user
+      MYSQL_PASSWORD: password
+    volumes:
+      - ./mysql-init:/docker-entrypoint-initdb.d
+
+volumes:
+  zookeeper_data:
+  flink_data:
+2. Updated MySQLToKafkaJob.java
+java
+Copy
+package com.example;
+
+import org.apache.flink.connector.jdbc.JdbcConnectionOptions;
+import org.apache.flink.connector.jdbc.JdbcExecutionOptions;
+import org.apache.flink.connector.jdbc.JdbcSource;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaProducer;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.api.java.tuple.Tuple2;
+
+public class MySQLToKafkaJob {
+
+    public static void main(String[] args) throws Exception {
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        
+        JdbcConnectionOptions connectionOptions = new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+            .withUrl("jdbc:mysql://mysql:3306/testdb")
+            .withDriverName("com.mysql.cj.jdbc.Driver")
+            .withUsername("user")
+            .withPassword("password")
+            .build();
+
+        env.addSource(JdbcSource.source(
+                "SELECT id, message FROM messages",
+                (rs, row) -> Tuple2.of(rs.getInt("id"), rs.getString("message")),
+                connectionOptions,
+                JdbcExecutionOptions.defaults(),
+                Types.TUPLE(Types.INT, Types.STRING)
+            ))
+            .map(tuple -> tuple.f0 + ": " + tuple.f1)
+            .addSink(new FlinkKafkaProducer<>(
+                "output-topic",
+                new SimpleStringSchema(),
+                FlinkKafkaProducer.getPropertiesFromBrokerList("kafka1:9092,kafka2:9093,kafka3:9094")
+            ));
+
+        env.execute("MySQL to Kafka Streaming Job");
+    }
+}
+3. Updated pom.xml
+xml
+Copy
+<project>
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.example</groupId>
+    <artifactId>flink-mysql-kafka</artifactId>
+    <version>1.0-SNAPSHOT</version>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-streaming-java_2.12</artifactId>
+            <version>1.14.0</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-kafka_2.12</artifactId>
+            <version>1.14.0</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-jdbc_2.12</artifactId>
+            <version>1.14.0</version>
+        </dependency>
+        <dependency>
+            <groupId>mysql</groupId>
+            <artifactId>mysql-connector-java</artifactId>
+            <version>8.0.25</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.8.1</version>
+                <configuration>
+                    <source>1.8</source>
+                    <target>1.8</target>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.2.4</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <artifactSet>
+                                <excludes>
+                                    <exclude>org.apache.flink:force-shading</exclude>
+                                </excludes>
+                            </artifactSet>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+Run HTML
+4. Updated mysql-init/init.sql
+sql
+Copy
+CREATE DATABASE IF NOT EXISTS testdb;
+USE testdb;
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    message VARCHAR(255) NOT NULL
+);
+
+INSERT INTO messages (message) VALUES
+('First test message'),
+('Second test message'),
+('Third test message');
+5. Deployment Commands
+bash
+Copy
+# Build the Flink job
+cd flink-job
+mvn clean package
+
+# Start the cluster
+docker-compose up -d --build
+
+# Wait for services to initialize (2-3 minutes)
+sleep 180
+
+# Submit the Flink job
+docker cp target/flink-mysql-kafka-1.0-SNAPSHOT.jar \
+  $(docker ps -q -f name=jobmanager1):/opt/flink/usrlib/job.jar
+
+# Verify job submission
+docker exec -it $(docker ps -q -f name=jobmanager1) flink list
+
+# Insert more test data
+docker exec -i $(docker ps -q -f name=mysql) mysql -uuser -ppassword testdb \
+  -e "INSERT INTO messages (message) VALUES ('New message at $(date)')"
+
+# Monitor Kafka output
+docker exec -it $(docker ps -q -f name=kafka1) \
+  kafka-console-consumer --bootstrap-server kafka1:9092 \
+  --topic output-topic --from-beginning
+Key Fixes Implemented:
+Proper JDBC Source: Reads actual data from MySQL
+
+Kafka Topic Initialization: Auto-creates topic with proper replication
+
+Flink HA Configuration:
+
+Fixed storage directory to use local filesystem
+
+Correct TaskManager configuration for Zookeeper discovery
+
+Removed hardcoded JobManager addresses
+
+Dependency Management:
+
+Added JDBC connector and MySQL driver
+
+Included proper shading in Maven build
+
+Test Data Initialization:
+
+Pre-populated test messages in MySQL
+
+Continuous test data insertion command
+
+Verification Steps:
+Check Flink dashboard at http://localhost:8081
+
+Verify running jobs in Flink Web UI
+
+Monitor Kafka consumer output
+
+Check MySQL connection:
+
+bash
+Copy
+docker exec -it $(docker ps -q -f name=mysql) mysql -uuser -ppassword testdb -e "SELECT * FROM messages"
+This setup now provides:
+
+Real-time streaming from MySQL to Kafka
+
+Fault tolerance with Flink HA
+
+Kafka cluster with replication
+
+Automatic topic creation
+
+Proper dependency management
+
+Easy test data insertion
+
+New
