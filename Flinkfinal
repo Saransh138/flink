@@ -1,0 +1,489 @@
+├── docker-compose.yml
+├── flink-job/
+│   ├── src/
+│   │   └── main/
+│   │       ├── java/
+│   │       │   └── com/
+│   │       │       └── example/
+│   │       │           └── MySQLToKafkaJob.java
+│   │       └── resources/
+│   │           └── log4j.properties
+│   ├── pom.xml
+│   └── Dockerfile
+├── mysql-init/
+│   └── init.sql
+└── README.md
+
+
+My files :
+
+version: '3.8'
+
+services:
+  zookeeper:
+    image: zookeeper:3.7
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.2'
+
+  kafka1:
+    image: confluentinc/cp-kafka:6.2.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka1:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    depends_on:
+      - zookeeper
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  kafka2:
+    image: confluentinc/cp-kafka:6.2.0
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka2:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    depends_on:
+      - zookeeper
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  kafka3:
+    image: confluentinc/cp-kafka:6.2.0
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3:9094
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    depends_on:
+      - zookeeper
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  jobmanager1:
+    image: flink:1.14.0-scala_2.12
+    ports:
+      - "8081:8081"
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager1
+      - HIGH_AVAILABILITY=zookeeper
+      - HIGH_AVAILABILITY_ZOOKEEPER_QUORUM=zookeeper:2181
+      - HIGH_AVAILABILITY_STORAGE_DIR=hdfs:///flink/ha/
+    volumes:
+      - flink_data:/tmp/flink
+    command: jobmanager
+    depends_on:
+      - zookeeper
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  jobmanager2:
+    image: flink:1.14.0-scala_2.12
+    ports:
+      - "8082:8082"
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager2
+      - HIGH_AVAILABILITY=zookeeper
+      - HIGH_AVAILABILITY_ZOOKEEPER_QUORUM=zookeeper:2181
+      - HIGH_AVAILABILITY_STORAGE_DIR=hdfs:///flink/ha/
+    volumes:
+      - flink_data:/tmp/flink
+    command: jobmanager
+    depends_on:
+      - zookeeper
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  jobmanager3:
+    image: flink:1.14.0-scala_2.12
+    ports:
+      - "8083:8083"
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager3
+      - HIGH_AVAILABILITY=zookeeper
+      - HIGH_AVAILABILITY_ZOOKEEPER_QUORUM=zookeeper:2181
+      - HIGH_AVAILABILITY_STORAGE_DIR=hdfs:///flink/ha/
+    volumes:
+      - flink_data:/tmp/flink
+    command: jobmanager
+    depends_on:
+      - zookeeper
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  taskmanager1:
+    image: flink:1.14.0-scala_2.12
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager1
+    depends_on:
+      - jobmanager1
+    command: taskmanager
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+  taskmanager2:
+    image: flink:1.14.0-scala_2.12
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager2
+    depends_on:
+      - jobmanager2
+    command: taskmanager
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+  taskmanager3:
+    image: flink:1.14.0-scala_2.12
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager3
+    depends_on:
+      - jobmanager3
+    command: taskmanager
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+  mysql:
+    image: mysql:5.7
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: user
+      MYSQL_PASSWORD: password
+    volumes:
+      - ./mysql-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+volumes:
+  zookeeper_data:
+  flink_data:
+  
+  
+  
+  
+  
+  
+  
+package com.example;
+
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaProducer;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.streaming.util.serialization.SimpleStringSchema;
+
+public class MySQLToKafkaJob {
+
+    public static void main(String[] args) throws Exception {
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // Example: Consume from MySQL and send to Kafka
+        env.fromElements(Tuple2.of("key", "value"))
+            .map(new MapFunction<Tuple2<String, String>, String>() {
+                @Override
+                public String map(Tuple2<String, String> value) throws Exception {
+                    return value.f0 + ": " + value.f1;
+                }
+            })
+            .addSink(new FlinkKafkaProducer<String>(
+                "kafka1:9092,kafka2:9093,kafka3:9094",  // Multiple Kafka brokers for failover
+                "output-topic",                        // Kafka topic
+                new SimpleStringSchema()               // Use SimpleStringSchema for serialization
+            ));
+
+        env.execute("MySQL to Kafka Job");
+    }
+}
+
+
+
+CREATE DATABASE IF NOT EXISTS testdb;
+USE testdb;
+CREATE TABLE IF NOT EXISTS messages (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    message VARCHAR(255) NOT NULL
+);
+
+
+
+## Steps to Run
+
+1. Build the Flink job:
+    ```bash
+    cd flink-job
+    mvn clean package
+    ```
+
+2. Start the Docker containers:
+    ```bash
+    docker-compose up -d
+    ```
+
+3. Copy the Flink job JAR to the JobManager:
+    ```bash
+    docker cp target/flink-mysql-kafka-1.0-SNAPSHOT.jar flink-mysql-kafka-ha_jobmanager1_1:/opt/flink/job/
+    ```
+
+4. Submit the job:
+    ```bash
+    docker exec -it flink-mysql-kafka-ha_jobmanager1_1 flink run /opt/flink/job/flink-mysql-kafka-1.0-SNAPSHOT.jar
+    ```
+
+5. Test failover by stopping Kafka brokers or JobManagers.
+
+## Verification
+
+- Check Flink dashboard: `http://localhost:8081`
+- Verify Kafka consumer data:
+    ```bash
+    docker exec -it flink-mysql-kafka-ha_kafka1_1 kafka-console-consumer --bootstrap-server kafka1:9092 --topic output-topic --from-beginning
+    ```
+- Verify MySQL data.
+
+## Troubleshooting
+
+- If JobManager fails, Zookeeper will promote another JobManager to continue processing.
+- Kafka replication ensures that data will not be lost even if one broker goes down.
+
+
+
+
+
+
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>flink-mysql-kafka</artifactId>
+    <version>1.0-SNAPSHOT</version>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-streaming-java_2.12</artifactId>
+            <version>1.14.0</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-kafka_2.12</artifactId>
+            <version>1.14.0</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.8.1</version>
+                <configuration>
+                    <source>1.8</source>
+                    <target>1.8</target>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+
+
+log4j.rootLogger=INFO, console
+log4j.appender.console=org.apache.log4j.ConsoleAppender
+log4j.appender.console.Target=System.out
+log4j.appender.console.layout=org.apache.log4j.PatternLayout
+log4j.appender.console.layout.ConversionPattern=%d{yyyy-MM-dd HH:mm:ss} %p %c{1}: %m%n
+
+
+Step 1: Build the Flink Job
+
+bash
+Copy
+cd flink-job
+mvn clean package
+cd ..
+Step 2: Start Docker Services
+
+bash
+Copy
+docker-compose up -d
+Step 3: Create Kafka Topic
+
+bash
+Copy
+docker exec kafka1 kafka-topics --create \
+  --bootstrap-server kafka1:9092 \
+  --topic output-topic \
+  --partitions 3 \
+  --replication-factor 3
+Step 4: Submit Flink Job
+
+bash
+Copy
+# Copy JAR to JobManager
+docker cp flink-job/target/flink-mysql-kafka-1.0-SNAPSHOT.jar jobmanager1:/opt/flink/job/
+
+# Submit job
+docker exec jobmanager1 flink run -d /opt/flink/job/flink-mysql-kafka-1.0-SNAPSHOT.jar
+Step 5: Insert Test Data into MySQL
+
+bash
+Copy
+docker exec -it mysql mysql -u user -ppassword testdb
+
+# In MySQL shell:
+INSERT INTO messages (message) VALUES ('First test message');
+INSERT INTO messages (message) VALUES ('Second test message');
+COMMIT;
+Step 6: Verify Kafka Output
+
+bash
+Copy
+docker exec -it kafka1 kafka-console-consumer \
+  --bootstrap-server kafka1:9092 \
+  --topic output-topic \
+  --from-beginning
+3. Verification Steps
+Check Flink Dashboard:
+
+Access any of these URLs:
+
+http://localhost:8081
+
+http://localhost:8082
+
+http://localhost:8083
+
+Verify MySQL Data:
+
+bash
+Copy
+docker exec -it mysql mysql -u user -ppassword testdb -e "SELECT * FROM messages;"
+Check TaskManager Logs:
+
+bash
+Copy
+docker logs taskmanager1
+4. Failure Testing
+Test JobManager Failover:
+
+bash
+Copy
+docker stop jobmanager1
+# Refresh Flink dashboard on 8082 or 8083
+# Continue inserting data to MySQL - processing should continue
+Test Kafka Broker Failure:
+
+bash
+Copy
+docker stop kafka2
+# Continue inserting data - messages should still be consumed
+5. Troubleshooting Tips
+If job submission fails:
+
+bash
+Copy
+# Check JobManager logs
+docker logs jobmanager1
+If no data in Kafka:
+
+bash
+Copy
+# Verify topic details
+docker exec kafka1 kafka-topics --describe \
+  --bootstrap-server kafka1:9092 \
+  --topic output-topic
+If MySQL connection fails:
+
+bash
+Copy
+# Test MySQL connectivity
+docker exec jobmanager1 curl -v telnet://mysql:3306
+To restart the pipeline:
+
+bash
+Copy
+# Cancel and resubmit job
+docker exec jobmanager1 flink cancel <job-id>
+docker exec jobmanager1 flink run -d /opt/flink/job/flink-mysql-kafka-1.0-SNAPSHOT.jar
