@@ -1,0 +1,595 @@
+.
+├── Dockerfile
+├── docker-compose.yml
+├── flink-conf/
+│   └── flink-conf.yaml
+├── kafka-config/
+│   └── server.properties
+├── mysql-init/
+│   └── init.sql
+├── jobs/
+│   └── flink-cdc-kafka-1.0-SNAPSHOT.jar
+├── monitor-kafka.sh
+├── src/
+│   └── main/
+│       └── java/
+│           └── com/
+│               └── example/
+│                   └── FlinkCdcToKafkaJob.java
+└── pom.xml
+
+
+
+FROM openjdk:11-jre-slim
+
+# Set environment variables
+ENV FLINK_VERSION=1.18.1
+ENV KAFKA_VERSION=3.5.1
+ENV SCALA_VERSION=2.13
+ENV MYSQL_VERSION=8.0.33
+ENV MYSQL_CONNECTOR_VERSION=8.0.33
+ENV FLINK_CDC_VERSION=3.0.1
+ENV ZOOKEEPER_VERSION=3.8.3
+
+# Install required packages
+RUN apt-get update && \
+    apt-get install -y curl wget netcat-openbsd procps gnupg2 lsb-release && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install MySQL
+RUN wget https://dev.mysql.com/get/mysql-apt-config_0.8.24-1_all.deb && \
+    dpkg -i mysql-apt-config_0.8.24-1_all.deb && \
+    apt-get update && \
+    apt-get install -y mysql-server && \
+    rm mysql-apt-config_0.8.24-1_all.deb
+
+# Create necessary directories
+RUN mkdir -p /opt/flink /opt/kafka /opt/zookeeper /opt/mysql-connector
+
+# Download and set up Flink
+RUN curl -L https://archive.apache.org/dist/flink/flink-${FLINK_VERSION}/flink-${FLINK_VERSION}-bin-scala_${SCALA_VERSION}.tgz -o /opt/flink.tgz && \
+    tar -xzf /opt/flink.tgz -C /opt/flink --strip-components=1 && \
+    rm /opt/flink.tgz
+
+# Download and set up Kafka
+RUN curl -L https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/kafka_${SCALA_VERSION}-${KAFKA_VERSION}.tgz -o /opt/kafka.tgz && \
+    tar -xzf /opt/kafka.tgz -C /opt/kafka --strip-components=1 && \
+    rm /opt/kafka.tgz
+
+# Download and set up ZooKeeper
+RUN curl -L https://archive.apache.org/dist/zookeeper/zookeeper-${ZOOKEEPER_VERSION}/apache-zookeeper-${ZOOKEEPER_VERSION}-bin.tar.gz -o /opt/zookeeper.tgz && \
+    tar -xzf /opt/zookeeper.tgz -C /opt/zookeeper --strip-components=1 && \
+    rm /opt/zookeeper.tgz
+
+# Configure ZooKeeper
+RUN cp /opt/zookeeper/conf/zoo_sample.cfg /opt/zookeeper/conf/zoo.cfg
+
+# Download MySQL connector
+RUN curl -L https://repo1.maven.org/maven2/mysql/mysql-connector-java/${MYSQL_CONNECTOR_VERSION}/mysql-connector-java-${MYSQL_CONNECTOR_VERSION}.jar -o /opt/mysql-connector/mysql-connector-java.jar
+
+# Download Flink CDC connector
+RUN mkdir -p /opt/flink/plugins/flink-connector-mysql-cdc && \
+    curl -L https://repo1.maven.org/maven2/com/ververica/flink-sql-connector-mysql-cdc/${FLINK_CDC_VERSION}/flink-sql-connector-mysql-cdc-${FLINK_CDC_VERSION}.jar -o /opt/flink/plugins/flink-connector-mysql-cdc/flink-sql-connector-mysql-cdc-${FLINK_CDC_VERSION}.jar && \
+    curl -L https://repo1.maven.org/maven2/org/apache/flink/flink-connector-kafka/${FLINK_VERSION}/flink-connector-kafka-${FLINK_VERSION}.jar -o /opt/flink/lib/flink-connector-kafka-${FLINK_VERSION}.jar
+
+# Copy MySQL connector to Flink lib directory
+RUN cp /opt/mysql-connector/mysql-connector-java.jar /opt/flink/lib/
+
+# Set PATH
+ENV PATH=$PATH:/opt/flink/bin:/opt/kafka/bin:/opt/zookeeper/bin
+
+# Create startup scripts
+RUN echo '#!/bin/bash\n/opt/zookeeper/bin/zkServer.sh start-foreground' > /opt/start-zookeeper.sh && \
+    echo '#!/bin/bash\n/opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties' > /opt/start-kafka.sh && \
+    echo '#!/bin/bash\n/etc/init.d/mysql start && mysql -u root -e "CREATE DATABASE IF NOT EXISTS testdb; CREATE USER IF NOT EXISTS '"'"'testuser'"'"'@'"'"'%'"'"' IDENTIFIED BY '"'"'testpassword'"'"'; GRANT ALL PRIVILEGES ON testdb.* TO '"'"'testuser'"'"'@'"'"'%'"'"'; FLUSH PRIVILEGES;"' > /opt/start-mysql.sh && \
+    echo '#!/bin/bash\n/opt/flink/bin/start-cluster.sh && tail -f /opt/flink/log/flink-*-jobmanager-*.log' > /opt/start-flink-jobmanager.sh && \
+    echo '#!/bin/bash\n/opt/flink/bin/taskmanager.sh start && tail -f /opt/flink/log/flink-*-taskmanager-*.log' > /opt/start-flink-taskmanager.sh && \
+    chmod +x /opt/start-*.sh
+
+# Setup MySQL configs for CDC
+RUN echo '[mysqld]\nserver-id=1\nlog-bin=mysql-bin\nbinlog-format=ROW\ndefault-authentication-plugin=mysql_native_password\ndefault-time-zone=+00:00' >> /etc/mysql/mysql.conf.d/mysqld.cnf
+
+WORKDIR /opt
+
+# Expose necessary ports
+# Flink UI
+EXPOSE 8081
+# Kafka
+EXPOSE 9092
+# ZooKeeper
+EXPOSE 2181
+# MySQL
+EXPOSE 3306
+
+CMD ["bash"]
+
+
+
+
+version: '3'
+
+services:
+  zookeeper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: flink-kafka-mysql:latest
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/opt/zookeeper/data
+    command: /opt/start-zookeeper.sh
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: flink-kafka-mysql:latest
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    volumes:
+      - ./kafka-config:/opt/kafka/config
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    command: /opt/start-kafka.sh
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mysql:
+    image: flink-kafka-mysql:latest
+    container_name: mysql
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpassword
+    command: /opt/start-mysql.sh
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  flink-jobmanager:
+    image: flink-kafka-mysql:latest
+    container_name: flink-jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+    volumes:
+      - ./flink-conf:/opt/flink/conf
+      - ./jobs:/jobs
+    command: /opt/start-flink-jobmanager.sh
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+
+  flink-taskmanager:
+    image: flink-kafka-mysql:latest
+    container_name: flink-taskmanager
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+    volumes:
+      - ./flink-conf:/opt/flink/conf
+    command: /opt/start-flink-taskmanager.sh
+    depends_on:
+      - flink-jobmanager
+
+volumes:
+  zookeeper_data:
+  mysql_data:
+  
+  
+  
+  
+  
+  
+  
+  
+  
+# Kafka server properties (kafka-config/server.properties)
+
+# The id of the broker
+broker.id=1
+
+# The address the socket server listens on
+listeners=PLAINTEXT://0.0.0.0:9092
+
+# Hostname and port the broker will advertise to producers and consumers
+advertised.listeners=PLAINTEXT://kafka:9092
+
+# The number of threads handling network requests
+num.network.threads=3
+
+# The number of threads doing disk I/O
+num.io.threads=8
+
+# The send buffer used by the socket server
+socket.send.buffer.bytes=102400
+
+# The receive buffer used by the socket server
+socket.receive.buffer.bytes=102400
+
+# The maximum size of a request that the socket server will accept
+socket.request.max.bytes=104857600
+
+# A comma separated list of directories under which to store log files
+log.dirs=/tmp/kafka-logs
+
+# The default number of log partitions per topic
+num.partitions=1
+
+# The number of threads per data directory to be used for log recovery at startup
+num.recovery.threads.per.data.dir=1
+
+# The minimum age of a log file to be eligible for deletion due to age
+log.retention.hours=168
+
+# The maximum size of a log segment file. When this size is reached a new log segment will be created
+log.segment.bytes=1073741824
+
+# The interval at which log segments are checked to see if they can be deleted
+log.retention.check.interval.ms=300000
+
+# ZooKeeper connection string
+zookeeper.connect=zookeeper:2181
+
+# Timeout in ms for connecting to ZooKeeper
+zookeeper.connection.timeout.ms=18000
+
+# Enable topic deletion
+delete.topic.enable=true
+
+
+
+
+
+
+
+
+
+
+
+-- MySQL Initialization Script (mysql-init/init.sql)
+
+-- Create a sample table
+CREATE TABLE IF NOT EXISTS customers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100),
+    email VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- Insert sample data
+INSERT INTO customers (name, email) VALUES 
+('John Doe', 'john@example.com'),
+('Jane Smith', 'jane@example.com'),
+('Bob Johnson', 'bob@example.com');
+
+-- Grant permissions for CDC
+GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'testuser'@'%';
+FLUSH PRIVILEGES;
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.example;
+
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
+import org.apache.flink.connector.kafka.sink.KafkaSink;
+import org.apache.flink.formats.json.JsonSerializationSchema;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.util.Collector;
+import org.apache.flink.streaming.api.functions.ProcessFunction;
+import org.apache.kafka.clients.producer.ProducerConfig;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.ververica.cdc.connectors.mysql.source.MySqlSource;
+import com.ververica.cdc.connectors.mysql.table.StartupOptions;
+import com.ververica.cdc.debezium.JsonDebeziumDeserializationSchema;
+
+import java.util.Properties;
+
+public class DirectFlinkCdcToKafkaJob {
+
+    public static void main(String[] args) throws Exception {
+        // Set up the streaming execution environment
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // Configure MySQL CDC Source
+        MySqlSource<String> mySqlSource = MySqlSource.<String>builder()
+                .hostname("mysql")
+                .port(3306)
+                .databaseList("testdb")
+                .tableList("testdb.customers") 
+                .username("testuser")
+                .password("testpassword")
+                .serverTimeZone("UTC")
+                .deserializer(new JsonDebeziumDeserializationSchema())
+                .startupOptions(StartupOptions.initial())
+                .build();
+
+        // Configure Kafka Sink
+        Properties kafkaProps = new Properties();
+        kafkaProps.setProperty(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+        kafkaProps.setProperty(ProducerConfig.ACKS_CONFIG, "all");
+        kafkaProps.setProperty(ProducerConfig.RETRIES_CONFIG, "3");
+
+        KafkaSink<String> kafkaSink = KafkaSink.<String>builder()
+                .setBootstrapServers("kafka:9092")
+                .setRecordSerializer(KafkaRecordSerializationSchema.builder()
+                        .setTopic("mysql-customers")
+                        .setValueSerializationSchema(new SimpleStringSchema())
+                        .build())
+                .setKafkaProducerConfig(kafkaProps)
+                .build();
+
+        // Add MySql source to the environment as a source, and create a DataStream
+        DataStream<String> mySqlDataStream = env.fromSource(
+                mySqlSource,
+                WatermarkStrategy.noWatermarks(),
+                "MySQL CDC Source"
+        );
+
+        // Process the data to transform it if needed
+        DataStream<String> processedStream = mySqlDataStream.process(new ProcessFunction<String, String>() {
+            private final ObjectMapper objectMapper = new ObjectMapper();
+            
+            @Override
+            public void processElement(String value, Context ctx, Collector<String> out) throws Exception {
+                try {
+                    // Parse the CDC event
+                    ObjectNode jsonNode = (ObjectNode) objectMapper.readTree(value);
+                    
+                    // Simple transformation - retain only the 'after' part of the CDC event
+                    // which contains the current state of the record
+                    if (jsonNode.has("after") && !jsonNode.get("after").isNull()) {
+                        out.collect(jsonNode.get("after").toString());
+                    } else if (jsonNode.has("before") && !jsonNode.get("before").isNull() && 
+                               jsonNode.has("op") && "d".equals(jsonNode.get("op").asText())) {
+                        // It's a delete operation, send the 'before' data with a deletion flag
+                        ObjectNode beforeNode = (ObjectNode) jsonNode.get("before");
+                        beforeNode.put("deleted", true);
+                        out.collect(beforeNode.toString());
+                    }
+                } catch (Exception e) {
+                    // If there's an error in processing, just forward the original message
+                    out.collect(value);
+                }
+            }
+        });
+
+        // Sink the stream to Kafka
+        processedStream.sinkTo(kafkaSink);
+
+        // Execute the job
+        env.execute("MySQL CDC to Kafka Direct Job");
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>flink-cdc-kafka</artifactId>
+    <version>1.0-SNAPSHOT</version>
+
+    <properties>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <flink.version>1.18.1</flink.version>
+        <flink.cdc.version>3.0.1</flink.cdc.version>
+        <jackson.version>2.14.2</jackson.version>
+    </properties>
+
+    <dependencies>
+        <!-- Flink Core -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-java</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-streaming-java</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-clients</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+        
+        <!-- Flink CDC Connector -->
+        <dependency>
+            <groupId>com.ververica</groupId>
+            <artifactId>flink-connector-mysql-cdc</artifactId>
+            <version>${flink.cdc.version}</version>
+        </dependency>
+        
+        <!-- Flink Kafka Connector -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-kafka</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+        
+        <!-- JSON Processing -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-json</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+        
+        <!-- Logging -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>1.7.36</version>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-log4j12</artifactId>
+            <version>1.7.36</version>
+        </dependency>
+        <dependency>
+            <groupId>log4j</groupId>
+            <artifactId>log4j</artifactId>
+            <version>1.2.17</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.2.4</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.example.DirectFlinkCdcToKafkaJob</mainClass>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+
+
+
+# Flink Configuration file (flink-conf/flink-conf.yaml)
+
+jobmanager.rpc.address: flink-jobmanager
+jobmanager.rpc.port: 6123
+jobmanager.memory.process.size: 1600m
+taskmanager.memory.process.size: 1728m
+taskmanager.numberOfTaskSlots: 2
+parallelism.default: 2
+
+
+
+
+#!/bin/bash
+
+# Script to monitor a Kafka topic (monitor-kafka.sh)
+# Usage: ./monitor-kafka.sh [topic-name]
+
+TOPIC=${1:-mysql-customers}
+
+docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic $TOPIC \
+  --from-beginning
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+
+
+
+
+
+
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+wget  https://repo1.maven.org/maven2/org/apache/flink/flink-connector-kafka_2.12/1.12.1/flink-connector-kafka_2.12-1.12.1.jar
