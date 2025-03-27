@@ -1,0 +1,202 @@
+
+Copy
+redis-sentinel-setup/
+├── docker-compose.yml
+├── redis/
+│   ├── redis-master.conf
+│   ├── redis-slave.conf
+│   ├── sentinel1.conf
+│   ├── sentinel2.conf
+│   └── sentinel3.conf
+└── data/
+    ├── redis1/
+    ├── redis2/
+    └── redis3/
+1. Redis Configurations
+redis/redis-master.conf
+
+conf
+Copy
+bind 0.0.0.0
+port 6379
+appendonly yes
+dir /data
+redis/redis-slave.conf
+
+conf
+Copy
+bind 0.0.0.0
+port 6379
+replicaof redis1 6379
+appendonly yes
+dir /data
+2. Sentinel Configurations
+redis/sentinel1.conf
+
+conf
+Copy
+port 26379
+sentinel resolve-hostnames yes
+sentinel announce-hostnames yes
+sentinel monitor mymaster redis1 6379 2
+sentinel down-after-milliseconds mymaster 5000
+sentinel failover-timeout mymaster 10000
+sentinel parallel-syncs mymaster 1
+sentinel auth-pass mymaster "yourpassword"  # Optional
+dir "/data"
+redis/sentinel2.conf & redis/sentinel3.conf
+(Same as sentinel1.conf - Sentinels will auto-update these files)
+
+3. Docker Compose File
+docker-compose.yml
+
+yaml
+Copy
+version: '3.8'
+
+services:
+  redis1:
+    image: redis:7.2
+    container_name: redis1
+    volumes:
+      - ./data/redis1:/data
+      - ./redis/redis-master.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    restart: unless-stopped
+    networks:
+      - redis-network
+    ports:
+      - "6379:6379"
+
+  redis2:
+    image: redis:7.2
+    container_name: redis2
+    volumes:
+      - ./data/redis2:/data
+      - ./redis/redis-slave.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    restart: unless-stopped
+    networks:
+      - redis-network
+    ports:
+      - "6380:6379"
+
+  redis3:
+    image: redis:7.2
+    container_name: redis3
+    volumes:
+      - ./data/redis3:/data
+      - ./redis/redis-slave.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    restart: unless-stopped
+    networks:
+      - redis-network
+    ports:
+      - "6381:6379"
+
+  sentinel1:
+    image: redis:7.2
+    container_name: sentinel1
+    command: 
+      - sh 
+      - -c 
+      - "sleep 30 && redis-server /etc/redis/sentinel.conf --sentinel"
+    volumes:
+      - ./redis/sentinel1.conf:/etc/redis/sentinel.conf
+      - ./data/sentinel1:/data
+    restart: unless-stopped
+    networks:
+      - redis-network
+    ports:
+      - "26379:26379"
+
+  sentinel2:
+    image: redis:7.2
+    container_name: sentinel2
+    command: 
+      - sh 
+      - -c 
+      - "sleep 30 && redis-server /etc/redis/sentinel.conf --sentinel"
+    volumes:
+      - ./redis/sentinel2.conf:/etc/redis/sentinel.conf
+      - ./data/sentinel2:/data
+    restart: unless-stopped
+    networks:
+      - redis-network
+    ports:
+      - "26380:26379"
+
+  sentinel3:
+    image: redis:7.2
+    container_name: sentinel3
+    command: 
+      - sh 
+      - -c 
+      - "sleep 30 && redis-server /etc/redis/sentinel.conf --sentinel"
+    volumes:
+      - ./redis/sentinel3.conf:/etc/redis/sentinel.conf
+      - ./data/sentinel3:/data
+    restart: unless-stopped
+    networks:
+      - redis-network
+    ports:
+      - "26381:26379"
+
+networks:
+  redis-network:
+    driver: bridge
+Key Features:
+Persistence:
+
+All Redis instances and Sentinels store data in mounted volumes
+
+Data survives container restarts
+
+Anti-Corruption Measures:
+
+30-second delay for Sentinels to ensure Redis nodes are ready
+
+Separate data directories for each instance
+
+unless-stopped restart policy
+
+Network Configuration:
+
+Dedicated bridge network for internal communication
+
+Port mapping for external access
+
+Setup Commands:
+bash
+Copy
+# Create directories
+mkdir -p {data/redis1,data/redis2,data/redis3,data/sentinel1,data/sentinel2,data/sentinel3}
+
+# Start the cluster
+docker-compose up -d
+
+# Verify setup
+docker exec -it redis1 redis-cli info replication
+docker exec -it sentinel1 redis-cli -p 26379 sentinel master mymaster
+Verification Workflow:
+Initial State:
+
+bash
+Copy
+docker exec redis1 redis-cli role  # Should be "master"
+docker exec redis2 redis-cli role  # Should be "slave"
+Failover Test:
+
+bash
+Copy
+docker stop redis1
+# Wait 30 seconds
+docker exec sentinel1 redis-cli -p 26379 sentinel get-master-addr-by-name mymaster
+Restart Original Master:
+
+bash
+Copy
+docker start redis1
+docker exec redis1 redis-cli role  # Should now show "slave"
+This setup ensures that once a new master is elected, the original master (redis1) will always rejoin as a replica even after full cluster restarts. The Sentinels maintain their state through restarts using the persisted configuration files.
+
