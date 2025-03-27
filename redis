@@ -1,0 +1,126 @@
+Now the problem is that If I am doing redis1 down and then redis2 or redis3 is becoming master and then if i am starting my redis1 again it is becoming master that I don't want I want that if my redis1 goes down and If I make it up again it should be worker because redis2 or redi3 is already master please resolve this and give full setup
+
+
+
+
+
+version: '3.8'
+
+services:
+  redis1:
+    image: redis:7.2
+    container_name: redis1
+    volumes:
+      - ./data/redis1:/data
+      - ./redis/redis-master.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    restart: always  
+    networks:
+      - redis-poc_redis-cluster  
+    ports:
+      - "6379:6379"
+
+  redis2:
+    image: redis:7.2
+    container_name: redis2
+    depends_on:
+      - redis1  # Ensures Redis2 starts only after Redis1
+    volumes:
+      - ./data/redis2:/data
+      - ./redis/redis-slave.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    restart: always  # Ensures automatic restart if Redis2 crashes
+    networks:
+      - redis-poc_redis-cluster  
+    ports:
+      - "6380:6379"
+
+  redis3:
+    image: redis:7.2
+    container_name: redis3
+    depends_on:
+      - redis1  # Ensures Redis3 starts only after Redis1
+    volumes:
+      - ./data/redis3:/data
+      - ./redis/redis-slave.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    restart: always  # Ensures automatic restart if Redis3 crashes
+    networks:
+      - redis-poc_redis-cluster  
+    ports:
+      - "6381:6379"
+
+  redis-sentinel1:
+    image: redis:7.2
+    container_name: redis-sentinel1
+    depends_on:
+      - redis1
+      - redis2
+      - redis3
+    command: /bin/sh -c "sleep 10 && redis-server /etc/redis/sentinel.conf --sentinel"
+    volumes:
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf
+    restart: always  
+    networks:
+      - redis-poc_redis-cluster
+    ports:
+      - "26379:26379"
+
+  redis-sentinel2:
+    image: redis:7.2
+    container_name: redis-sentinel2
+    depends_on:
+      - redis1
+      - redis2
+      - redis3
+    command: /bin/sh -c "sleep 10 && redis-server /etc/redis/sentinel.conf --sentinel"
+    volumes:
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf
+    restart: always  # Ensures Sentinel2 restarts automatically if it crashes
+    networks:
+      - redis-poc_redis-cluster  
+    ports:
+      - "26380:26379"
+
+  redis-sentinel3:
+    image: redis:7.2
+    container_name: redis-sentinel3
+    depends_on:
+      - redis1
+      - redis2
+      - redis3
+    command: /bin/sh -c "sleep 10 && redis-server /etc/redis/sentinel.conf --sentinel"
+    volumes:
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf
+    restart: always  
+    networks:
+      - redis-poc_redis-cluster 
+    ports:
+      - "26381:26379"
+
+networks:
+  redis-poc_redis-cluster:
+    external: true
+
+
+
+
+redis-master.conf 
+bind 0.0.0.0
+port 6379
+appendonly yes 
+
+redis-slave.conf 
+bind 0.0.0.0
+port 6379
+replicaof redis-master 6379  
+appendonly yes  
+
+
+sentinel.conf 
+port 26379
+sentinel resolve-hostnames yes
+sentinel monitor mymaster redis1 6379 2  
+sentinel down-after-milliseconds mymaster 5000  
+sentinel failover-timeout mymaster 10000  
+sentinel parallel-syncs mymaster 1  
