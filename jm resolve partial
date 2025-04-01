@@ -1,0 +1,630 @@
+#!/bin/bash
+
+# Create directory structure
+mkdir -p jmeter-api-project/src/main/java/com/loadtest/jmeterapi/{controller,model,service}
+mkdir -p jmeter-api-project/src/main/resources
+touch jmeter-api-project/{Dockerfile,pom.xml,build.sh,test-api.sh}
+
+# Create Java source files
+# JmeterApiApplication.java
+cat > jmeter-api-project/src/main/java/com/loadtest/jmeterapi/JmeterApiApplication.java << 'EOF'
+package com.loadtest.jmeterapi;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class JmeterApiApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(JmeterApiApplication.class, args);
+    }
+}
+EOF
+
+# LoadTestController.java
+cat > jmeter-api-project/src/main/java/com/loadtest/jmeterapi/controller/LoadTestController.java << 'EOF'
+package com.loadtest.jmeterapi.controller;
+
+import com.loadtest.jmeterapi.model.LoadTestRequest;
+import com.loadtest.jmeterapi.model.LoadTestResponse;
+import com.loadtest.jmeterapi.service.JMeterService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
+
+@RestController
+@RequestMapping("/api/loadtest")
+@RequiredArgsConstructor
+public class LoadTestController {
+    
+    private final JMeterService jmeterService;
+
+    @PostMapping
+    public ResponseEntity<LoadTestResponse> createTest(@Valid @RequestBody LoadTestRequest request) {
+        try {
+            return ResponseEntity.ok(jmeterService.createAndRunLoadTest(request));
+        } catch (Exception e) {
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, e.getMessage());
+        }
+    }
+}
+EOF
+
+# Model classes
+cat > jmeter-api-project/src/main/java/com/loadtest/jmeterapi/model/HttpMethod.java << 'EOF'
+package com.loadtest.jmeterapi.model;
+
+public enum HttpMethod {
+    GET, POST, PUT, DELETE, PATCH
+}
+EOF
+
+cat > jmeter-api-project/src/main/java/com/loadtest/jmeterapi/model/HttpSampler.java << 'EOF'
+package com.loadtest.jmeterapi.model;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+import java.util.Map;
+
+@Data
+public class HttpSampler {
+    @NotBlank private String name;
+    @NotNull private HttpMethod httpMethod;
+    @NotBlank private String path;
+    private Map<String, String> headers;
+    private String payload;
+    private Integer thinkTime;
+}
+EOF
+
+cat > jmeter-api-project/src/main/java/com/loadtest/jmeterapi/model/LoadTestRequest.java << 'EOF'
+package com.loadtest.jmeterapi.model;
+
+import jakarta.validation.constraints.*;
+import lombok.Data;
+import java.util.List;
+import java.util.Map;
+
+@Data
+public class LoadTestRequest {
+    @NotBlank private String testName;
+    @NotBlank private String baseUrl;
+    @Min(1) private Integer numUsers;
+    @Min(0) private Integer rampUpPeriod;
+    @Min(1) private Integer loopCount;
+    @NotEmpty private List<HttpSampler> samplers;
+    
+    // Remove these fields as they're duplicates of what's in the samplers
+    // private HttpMethod httpMethod;
+    // private String path;
+    // private Map<String, String> headers;
+    // private String payload;
+}
+EOF
+
+cat > jmeter-api-project/src/main/java/com/loadtest/jmeterapi/model/LoadTestResponse.java << 'EOF'
+package com.loadtest.jmeterapi.model;
+
+import lombok.Data;
+import java.util.Map;
+
+@Data
+public class LoadTestResponse {
+    private String testId;
+    private String jmxFilePath;
+    private String status;
+    private String resultsFilePath;
+    private Map<String, Object> summary;
+}
+EOF
+
+# JMeterService.java
+cat > jmeter-api-project/src/main/java/com/loadtest/jmeterapi/service/JMeterService.java << 'EOF'
+package com.loadtest.jmeterapi.service;
+
+import com.loadtest.jmeterapi.model.HttpMethod;
+import com.loadtest.jmeterapi.model.HttpSampler;
+import com.loadtest.jmeterapi.model.LoadTestRequest;
+import com.loadtest.jmeterapi.model.LoadTestResponse;
+import com.opencsv.CSVReader;
+import com.opencsv.exceptions.CsvException;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.jmeter.config.Arguments;
+import org.apache.jmeter.control.LoopController;
+import org.apache.jmeter.engine.StandardJMeterEngine;
+import org.apache.jmeter.protocol.http.control.Header;
+import org.apache.jmeter.protocol.http.control.HeaderManager;
+import org.apache.jmeter.protocol.http.sampler.HTTPSamplerProxy;
+import org.apache.jmeter.reporters.ResultCollector;
+import org.apache.jmeter.save.SaveService;
+import org.apache.jmeter.testelement.TestElement;
+import org.apache.jmeter.testelement.TestPlan;
+import org.apache.jmeter.threads.ThreadGroup;
+import org.apache.jmeter.util.JMeterUtils;
+import org.apache.jorphan.collections.HashTree;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+@Service
+@Slf4j
+public class JMeterService {
+
+    static {
+        try {
+            String jmeterHome = System.getenv("JMETER_HOME");
+            if (jmeterHome == null) {
+                throw new RuntimeException("JMETER_HOME environment variable not set");
+            }
+            
+            File homeDir = new File(jmeterHome);
+            if (!homeDir.exists()) {
+                throw new RuntimeException("JMETER_HOME directory not found: " + jmeterHome);
+            }
+
+            JMeterUtils.setJMeterHome(jmeterHome);
+            JMeterUtils.loadJMeterProperties(jmeterHome + "/bin/jmeter.properties");
+            JMeterUtils.initLocale();
+            SaveService.loadProperties();
+            
+            log.info("JMeter initialized successfully. Version: {}", JMeterUtils.getJMeterVersion());
+        } catch (Exception e) {
+            log.error("Failed to initialize JMeter", e);
+            throw new RuntimeException("JMeter initialization failed", e);
+        }
+    }
+
+    @Value("${jmeter.jmx.dir:/app/jmx-templates}")
+    private String jmxDir;
+
+    @Value("${jmeter.results.dir:/app/results}")
+    private String resultsDir;
+
+    public LoadTestResponse createAndRunLoadTest(LoadTestRequest request) throws Exception {
+        String testId = UUID.randomUUID().toString();
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+        String jmxFileName = String.format("%s_%s_%s.jmx",
+                request.getTestName().replaceAll("\\s+", "_"),
+                testId.substring(0, 8),
+                timestamp);
+
+        String jmxFilePath = jmxDir + "/" + jmxFileName;
+        String resultsFileName = jmxFileName.replace(".jmx", "_results.jtl");
+        String resultsFilePath = resultsDir + "/" + resultsFileName;
+
+        createDirectoryIfNotExists(jmxDir);
+        createDirectoryIfNotExists(resultsDir);
+
+        HashTree testPlanTree = createTestPlanTree(request, testId);
+        saveJmxFile(testPlanTree, jmxFilePath);
+
+        Map<String, Object> summary = runJMeterTest(testPlanTree, resultsFilePath);
+
+        LoadTestResponse response = new LoadTestResponse();
+        response.setTestId(testId);
+        response.setJmxFilePath(jmxFilePath);
+        response.setStatus("Completed");
+        response.setResultsFilePath(resultsFilePath);
+        response.setSummary(summary);
+
+        return response;
+    }
+
+    private HashTree createTestPlanTree(LoadTestRequest request, String testId) {
+        TestPlan testPlan = new TestPlan(request.getTestName());
+        testPlan.setProperty(TestElement.TEST_CLASS, TestPlan.class.getName());
+        testPlan.setProperty(TestElement.GUI_CLASS, TestPlan.class.getName());
+
+        HashTree testPlanTree = new HashTree();
+        HashTree testPlanNode = testPlanTree.add(testPlan);
+
+        ThreadGroup threadGroup = new ThreadGroup();
+        threadGroup.setName("Thread Group - " + request.getTestName());
+        threadGroup.setNumThreads(request.getNumUsers());
+        threadGroup.setRampUp(request.getRampUpPeriod());
+        threadGroup.setProperty(TestElement.TEST_CLASS, ThreadGroup.class.getName());
+        threadGroup.setProperty(TestElement.GUI_CLASS, ThreadGroup.class.getName());
+
+        LoopController loopController = new LoopController();
+        loopController.setLoops(request.getLoopCount());
+        loopController.setFirst(true);
+        loopController.setProperty(TestElement.TEST_CLASS, LoopController.class.getName());
+        loopController.setProperty(TestElement.GUI_CLASS, LoopController.class.getName());
+        loopController.initialize();
+        threadGroup.setSamplerController(loopController);
+
+        HashTree threadGroupNode = testPlanNode.add(threadGroup);
+        for (HttpSampler sampler : request.getSamplers()) {
+            HTTPSamplerProxy httpSampler = createHttpSampler(request.getBaseUrl(), sampler);
+            HeaderManager headerManager = createHeaderManager(sampler.getHeaders());
+
+            HashTree samplerNode = threadGroupNode.add(httpSampler);
+            if (sampler.getHeaders() != null && !sampler.getHeaders().isEmpty()) {
+                samplerNode.add(headerManager);
+            }
+        }
+        return testPlanTree;
+    }
+
+    private HTTPSamplerProxy createHttpSampler(String baseUrl, HttpSampler samplerConfig) {
+        HTTPSamplerProxy httpSampler = new HTTPSamplerProxy();
+        httpSampler.setName(samplerConfig.getName());
+        httpSampler.setDomain(extractDomain(baseUrl));
+        httpSampler.setPort(extractPort(baseUrl));
+        httpSampler.setProtocol(extractProtocol(baseUrl));
+        httpSampler.setPath(samplerConfig.getPath());
+        httpSampler.setMethod(samplerConfig.getHttpMethod().toString());
+
+        if (samplerConfig.getHttpMethod() == HttpMethod.POST && samplerConfig.getPayload() != null) {
+            httpSampler.setPostBodyRaw(true);
+            httpSampler.addNonEncodedArgument("", samplerConfig.getPayload(), "");
+        }
+
+        httpSampler.setProperty(TestElement.TEST_CLASS, HTTPSamplerProxy.class.getName());
+        httpSampler.setProperty(TestElement.GUI_CLASS, HTTPSamplerProxy.class.getName());
+
+        return httpSampler;
+    }
+
+    private HeaderManager createHeaderManager(Map<String, String> headers) {
+        HeaderManager headerManager = new HeaderManager();
+        headerManager.setName("HTTP Headers");
+        headerManager.setProperty(TestElement.TEST_CLASS, HeaderManager.class.getName());
+        headerManager.setProperty(TestElement.GUI_CLASS, HeaderManager.class.getName());
+
+        if (headers != null) {
+            headers.forEach((name, value) -> 
+                headerManager.add(new Header(name, value))
+            );
+        }
+
+        return headerManager;
+    }
+
+    private void saveJmxFile(HashTree testPlanTree, String filePath) throws IOException {
+        try (FileOutputStream os = new FileOutputStream(filePath)) {
+            SaveService.saveTree(testPlanTree, os);
+            log.info("JMX file saved to: {}", filePath);
+        } catch (Exception e) {
+            log.error("Failed to save JMX file", e);
+            throw new IOException("JMX file save failed", e);
+        }
+    }
+
+    private Map<String, Object> runJMeterTest(HashTree testPlanTree, String resultsFilePath) {
+        Map<String, Object> summary = new HashMap<>();
+        StandardJMeterEngine jmeterEngine = new StandardJMeterEngine();
+
+        try {
+            createDirectoryIfNotExists(new File(resultsFilePath).getParent());
+        
+            ResultCollector resultCollector = new ResultCollector();
+            resultCollector.setFilename(resultsFilePath);
+            testPlanTree.add(testPlanTree.getArray()[0], resultCollector);
+            jmeterEngine.configure(testPlanTree);
+            log.info("Starting JMeter test with results at: {}", resultsFilePath);
+            jmeterEngine.run();
+        
+            log.info("Test completed. Parsing results from: {}", resultsFilePath);
+            File resultsFile = new File(resultsFilePath);
+            if (resultsFile.exists()) {
+                parseResultsFile(resultsFilePath, summary);
+                summary.put("status", "Completed");
+            } else {
+                log.error("Results file not created: {}", resultsFilePath);
+                summary.put("status", "Failed");
+                summary.put("error", "Results file not created");
+            }
+        } catch (Exception e) {
+            log.error("Test execution failed", e);
+            summary.put("error", e.getMessage());
+            summary.put("status", "Failed");
+        } finally {
+            jmeterEngine.exit();
+        }
+    
+        return summary;
+    }
+
+    private void parseResultsFile(String resultsFilePath, Map<String, Object> summary) {
+        try (CSVReader csvReader = new CSVReader(new FileReader(resultsFilePath))) {
+            List<String[]> records = csvReader.readAll();
+            
+            int totalSamples = 0;
+            int errorCount = 0;
+            long totalElapsed = 0;
+
+            boolean isFirstLine = true;
+            for (String[] fields : records) {
+                if (isFirstLine) {
+                    isFirstLine = false;
+                    continue;
+                }
+
+                if (fields.length < 13) continue;
+
+                String success = fields[7];
+                String responseCode = fields[3];
+                String elapsed = fields[1];
+
+                totalSamples++;
+                if (!"true".equalsIgnoreCase(success) || !responseCode.startsWith("2")) {
+                    errorCount++;
+                }
+
+                try {
+                    totalElapsed += Long.parseLong(elapsed);
+                } catch (NumberFormatException e) {
+                    log.warn("Invalid elapsed time: {}", elapsed);
+                }
+            }
+
+            summary.put("totalSamples", totalSamples);
+            summary.put("errorCount", errorCount);
+            summary.put("averageTime", totalSamples > 0 ? totalElapsed / totalSamples : 0);
+            summary.put("errorRate", totalSamples > 0 ? (errorCount * 100.0 / totalSamples) : 0);
+
+        } catch (IOException | CsvException e) {
+            log.error("Failed to parse results file", e);
+            summary.put("parseError", e.getMessage());
+        }
+    }
+
+    private String extractDomain(String url) {
+        try {
+            return url.split("://")[1].split("/")[0].split(":")[0];
+        } catch (Exception e) {
+            log.warn("Invalid URL format: {}", url);
+            return url;
+        }
+    }
+
+    private int extractPort(String url) {
+        try {
+            String hostPart = url.split("://")[1].split("/")[0];
+            if (hostPart.contains(":")) {
+                return Integer.parseInt(hostPart.split(":")[1]);
+            }
+            return url.startsWith("https") ? 443 : 80;
+        } catch (Exception e) {
+            log.warn("Using default port for URL: {}", url);
+            return 80;
+        }
+    }
+
+    private String extractProtocol(String url) {
+        try {
+            return url.split("://")[0];
+        } catch (Exception e) {
+            log.warn("Using default HTTP protocol for URL: {}", url);
+            return "http";
+        }
+    }
+
+    private void createDirectoryIfNotExists(String dirPath) {
+        try {
+            Files.createDirectories(Path.of(dirPath));
+        } catch (IOException e) {
+            log.error("Failed to create directory: {}", dirPath, e);
+            throw new RuntimeException("Directory creation failed", e);
+        }
+    }
+}
+EOF
+
+# Create resources
+cat > jmeter-api-project/src/main/resources/application.properties << 'EOF'
+# Server
+server.port=8080
+
+# JMeter
+jmeter.jmx.dir=/app/jmx-templates
+jmeter.results.dir=/app/results
+
+# Logging
+logging.level.root=INFO
+logging.level.com.loadtest=DEBUG
+logging.file.name=/app/logs/jmeter-api.log
+EOF
+
+# Create Dockerfile
+cat > jmeter-api-project/Dockerfile << 'EOF'
+# Build stage
+FROM maven:3.8.5-eclipse-temurin-17 AS build
+WORKDIR /app
+
+# Copy project files
+COPY . .
+
+# Build the application
+RUN mvn clean package -DskipTests
+
+# Runtime stage
+FROM eclipse-temurin:17-jdk-jammy
+ENV JMETER_VERSION=5.6.2
+ENV JMETER_HOME=/opt/apache-jmeter-${JMETER_VERSION}
+
+# Install required dependencies and JMeter
+RUN apt-get update && \
+    apt-get install -y wget unzip && \
+    wget https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${JMETER_VERSION}.tgz -O /tmp/jmeter.tgz && \
+    tar -xzf /tmp/jmeter.tgz -C /opt && \
+    rm /tmp/jmeter.tgz
+
+# Set working directory
+WORKDIR /app
+
+# Copy built JAR from build stage
+COPY --from=build /app/target/*.jar /app/app.jar
+
+# Create necessary directories and set permissions
+RUN mkdir -p /app/{jmx-templates,results,logs} && \
+    chmod -R 777 /app
+
+# Expose application port
+EXPOSE 8080
+
+# Entry point for the application
+ENTRYPOINT ["java", \
+    "--add-opens=java.base/java.lang=ALL-UNNAMED", \
+    "--add-opens=java.base/java.util=ALL-UNNAMED", \
+    "-Djmeter.home=${JMETER_HOME}", \
+    "-jar", "/app/app.jar"]
+
+# Define volumes for JMeter files and logs
+VOLUME ["/app/jmx-templates", "/app/results", "/app/logs"]
+EOF
+
+# Create pom.xml
+cat > jmeter-api-project/pom.xml << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<project>
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.1.5</version>
+    </parent>
+    
+    <groupId>com.loadtest</groupId>
+    <artifactId>jmeter-api</artifactId>
+    <version>1.0.0</version>
+    
+    <properties>
+        <java.version>17</java.version>
+        <jmeter.version>5.6.2</jmeter.version>
+    </properties>
+    
+    <dependencies>
+        <!-- Spring Boot -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        
+        <!-- JMeter Core -->
+        <dependency>
+            <groupId>org.apache.jmeter</groupId>
+            <artifactId>ApacheJMeter_core</artifactId>
+            <version>${jmeter.version}</version>
+        </dependency>
+        
+        <!-- JMeter HTTP Protocol -->
+        <dependency>
+            <groupId>org.apache.jmeter</groupId>
+            <artifactId>ApacheJMeter_http</artifactId>
+            <version>${jmeter.version}</version>
+        </dependency>
+        
+        <!-- JMeter Components -->
+        <dependency>
+            <groupId>org.apache.jmeter</groupId>
+            <artifactId>ApacheJMeter_components</artifactId>
+            <version>${jmeter.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.28</version>
+            <scope>compile</scope>
+        </dependency>
+        
+        <!-- Other required dependencies -->
+        <dependency>
+            <groupId>com.opencsv</groupId>
+            <artifactId>opencsv</artifactId>
+            <version>5.7.1</version>
+        </dependency>
+        <dependency>
+            <groupId>com.thoughtworks.xstream</groupId>
+            <artifactId>xstream</artifactId>
+            <version>1.4.20</version>
+        </dependency>
+    </dependencies>
+    
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+EOF
+
+# Create build script
+cat > jmeter-api-project/build.sh << 'EOF'
+#!/bin/bash
+
+# Clean previous build
+docker rm -f jmeter-api >/dev/null 2>&1
+
+# Build and run
+docker build -t jmeter-api . && \
+docker run -d --name jmeter-api \
+  -p 8080:8080 \
+  -v $(pwd)/jmx:/app/jmx-templates \
+  -v $(pwd)/results:/app/results \
+  -v $(pwd)/logs:/app/logs \
+  jmeter-api
+
+echo "API running at http://localhost:8080"
+echo "Check logs: docker logs -f jmeter-api"
+EOF
+
+# Create test script
+cat > jmeter-api-project/test-api.sh << 'EOF'
+#!/bin/bash
+
+echo "Testing API endpoint..."
+curl -X POST http://localhost:8080/api/loadtest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "testName": "Health Check",
+    "baseUrl": "https://postman-echo.com",
+    "numUsers": 5,
+    "rampUpPeriod": 1,
+    "loopCount": 1,
+    "samplers": [
+      {
+        "name": "Simple GET",
+        "httpMethod": "GET",
+        "path": "/get",
+        "headers": {},
+        "payload": null
+      }
+    ]
+  }'
+
+echo -e "\n\nCheck results in:"
+echo "JMX files: ./jmx/"
+echo "Results:   ./results/"
+echo "Logs:      ./logs/"
+EOF
+
+# Set execute permissions
+chmod +x jmeter-api-project/build.sh
+chmod +x jmeter-api-project/test-api.sh
+
+echo "Project structure created successfully!"
